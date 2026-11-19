@@ -1,14 +1,13 @@
 
-import { spawn } from 'child_process';
-import { promises as fs } from 'fs';
-import path from 'path';
-import os from 'os';
-import { randomUUID } from 'crypto';
+import { spawn } from 'node:child_process';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_FILESIZE_BYTES = 50 * 1024 * 1024;
 const MAX_FILESIZE_ARG = '50M';
-const THUMBNAIL_ENABLED = true;
 
 export class DownloaderService {
   constructor() {
@@ -25,8 +24,7 @@ export class DownloaderService {
 
   async getFileSize(filePath) {
     try {
-      const stats = await fs.stat(filePath);
-      return stats.size;
+      return (await fs.stat(filePath)).size;
     } catch {
       return 0;
     }
@@ -35,8 +33,8 @@ export class DownloaderService {
   async removeTempDir(dir) {
     try {
       await fs.rm(dir, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
+    } catch (err) {
+      console.error('[Downloader] Cleanup error:', err.message);
     }
   }
 
@@ -46,10 +44,7 @@ export class DownloaderService {
     if (proc) {
       try {
         proc.kill('SIGKILL');
-      } catch {
-        // Ignore kill errors
-      }
-
+      } catch {}
       this.activeDownloads.delete(userId);
     }
   }
@@ -57,275 +52,264 @@ export class DownloaderService {
   downloadVideo(url, userId, options = {}) {
     return this.download(url, userId, {
       ...options,
-      audioOnly: false,
+      audioOnly: false
     });
   }
 
   downloadAudio(url, userId, options = {}) {
     return this.download(url, userId, {
       ...options,
-      audioOnly: true,
+      audioOnly: true
     });
   }
 
-  download(url, userId, options = {}) {
+  async download(url, userId, options = {}) {
     const { audioOnly = false, onProgress = null } = options;
+    const tempDir = this.createTempDir();
 
-    return new Promise(async (resolve, reject) => {
-      const tempDir = this.createTempDir();
+    await this.ensureTempDir(tempDir);
 
-      try {
-        await this.ensureTempDir(tempDir);
-      } catch (error) {
-        reject(new Error('Failed to create temporary directory.'));
-        return;
-      }
+    const outputTemplate = path.join(
+      tempDir,
+      audioOnly ? '%(title)s.mp3' : '%(title)s.%(ext)s'
+    );
 
-      let outputTemplate = path.join(tempDir, '%(title)s.%(ext)s');
-      const args = [
-        '--no-playlist',
-        '--max-filesize', MAX_FILESIZE_ARG,
-        '--restrict-filenames',
-        '--no-warnings',
-        '--geo-bypass',
-        '--extractor-args', 'youtube:player_client=android,web,mweb',
-        '--user-agent',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      ];
+    const args = [
+      '--no-playlist',
+      '--max-filesize', MAX_FILESIZE_ARG,
+      '--restrict-filenames',
+      '--no-warnings',
+      '--ignore-errors',
+      '-o', outputTemplate
+    ];
 
-      if (!audioOnly && THUMBNAIL_ENABLED) {
-        args.push('--write-thumbnail');
-      }
-
-      if (audioOnly) {
-        args.push(
-          '-f',
-          'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
-          '-x',
-          '--audio-format', 'mp3',
-          '--audio-quality', '192K',
-          '--postprocessor-args', 'ffmpeg:-ar 44100'
-        );
-
-        outputTemplate = path.join(tempDir, '%(title)s.mp3');
-      } else {
-        args.push(
-          '-f',
-          'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[height<=1080][ext=mp4]/best[ext=mp4]/best'
-        );
-      }
-
+    if (audioOnly) {
       args.push(
-        '-o', outputTemplate,
-        '--print', 'before_dl:%(title)s',
-        '--',
-        url
+        '-f', 'bestaudio/best',
+        '-x',
+        '--audio-format', 'mp3',
+        '--audio-quality', '192K'
       );
+    } else {
+      args.push(
+        '--write-thumbnail',
+        '-f',
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+      );
+    }
 
-      let proc;
-      let timeoutId;
-      let stderr = '';
-      let stdout = '';
-      let videoTitle = '';
-      let settled = false;
-      let timedOut = false;
+    args.push('--print', 'before_dl:%(title)s');
+    args.push('--', url);
 
-      const cleanup = async () => {
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-          timeoutId = null;
-        }
+    const candidates = [
+      process.env.YTDLP_PATH,
+      '/usr/local/bin/yt-dlp',
+      '/usr/bin/yt-dlp',
+      'yt-dlp'
+    ].filter(Boolean);
 
-        if (proc && this.activeDownloads.get(userId) === proc) {
-          this.activeDownloads.delete(userId);
-        }
-      };
+    let proc = null;
+    let timeoutId = null;
+    let stderr = '';
+    let stdout = '';
+    let title = '';
+    let settled = false;
+    let timedOut = false;
 
-      const fail = async (error) => {
+    const cleanup = async () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (this.activeDownloads.get(userId) === proc) {
+        this.activeDownloads.delete(userId);
+      }
+    };
+
+    return new Promise((resolve, reject) => {
+      const fail = async (message) => {
         if (settled) return;
         settled = true;
+
         await cleanup();
-        await this.removeTempDir(tempDir);
-        reject(error);
-      };
 
-      try {
-        // Use the executable installed in Docker's PATH.
-        const ytDlpCmd = process.env.YTDLP_PATH || 'yt-dlp';
-
-        console.log(`[Downloader] Starting: ${ytDlpCmd}`);
-
-        proc = spawn(ytDlpCmd, args, {
-          cwd: tempDir,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: {
-            ...process.env,
-            PATH: [
-              process.env.PATH || '',
-              '/usr/local/bin',
-              '/usr/bin',
-              '/bin',
-              '/root/.local/bin',
-            ].join(path.delimiter),
-          },
-        });
-
-        this.activeDownloads.set(userId, proc);
-
-        timeoutId = setTimeout(() => {
-          timedOut = true;
-          console.error('[Downloader] Download timed out.');
-
+        if (proc && proc.exitCode === null && !proc.killed) {
           try {
             proc.kill('SIGKILL');
-          } catch {
-            // Ignore kill errors
-          }
-        }, DOWNLOAD_TIMEOUT_MS);
+          } catch {}
+        }
+
+        await this.removeTempDir(tempDir);
+        reject(new Error(message));
+      };
+
+      const startProcess = (index) => {
+        if (index >= candidates.length) {
+          fail(
+            'yt-dlp executable not found. Checked: ' +
+            candidates.join(', ') +
+            '. Install yt-dlp in Dockerfile.'
+          );
+          return;
+        }
+
+        const command = candidates[index];
+
+        console.log('[Downloader] Trying executable:', command);
+
+        try {
+          proc = spawn(command, args, {
+            cwd: tempDir,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: {
+              ...process.env,
+              PATH: [
+                process.env.PATH || '',
+                '/usr/local/bin',
+                '/usr/bin',
+                '/bin'
+              ].join(path.delimiter)
+            }
+          });
+        } catch (err) {
+          console.error('[Downloader] Spawn error:', err.message);
+          startProcess(index + 1);
+          return;
+        }
+
+        let started = false;
+
+        proc.once('spawn', () => {
+          started = true;
+          this.activeDownloads.set(userId, proc);
+
+          timeoutId = setTimeout(() => {
+            timedOut = true;
+            try {
+              proc.kill('SIGKILL');
+            } catch {}
+          }, DOWNLOAD_TIMEOUT_MS);
+        });
 
         proc.stdout.on('data', (data) => {
           const text = data.toString();
           stdout += text;
 
-          const titleMatch = stdout.match(/before_dl:([^\r\n]+)/);
-          if (titleMatch) {
-            videoTitle = titleMatch[1].trim();
-          }
+          const match = text.match(/before_dl:(.+)/);
+          if (match) title = match[1].trim();
         });
 
         proc.stderr.on('data', (data) => {
           const text = data.toString();
           stderr += text;
 
-          if (stderr.length > 12000) {
-            stderr = stderr.slice(-12000);
+          if (stderr.length > 15000) {
+            stderr = stderr.slice(-15000);
           }
 
-          if (onProgress && typeof onProgress === 'function') {
-            try {
-              const percentMatch = text.match(
-                /\[download\]\s+([0-9]+(?:\.[0-9]+)?)%/
-              );
-              const speedMatch = text.match(/at\s+([0-9]+(?:\.[0-9]+)?\S+\/s)/i);
-              const etaMatch = text.match(/ETA\s+([0-9:]+)/i);
+          if (typeof onProgress === 'function') {
+            const percent = text.match(
+              /\[download\]\s+([\d.]+)%/
+            );
+            const speed = text.match(/at\s+([\d.]+\s*\S+\/s)/i);
+            const eta = text.match(/ETA\s+([\d:]+)/i);
 
-              if (percentMatch) {
-                const info = {
-                  percent: parseFloat(percentMatch[1]),
-                };
-
-                if (speedMatch) info.speed = speedMatch[1];
-                if (etaMatch) info.eta = etaMatch[1];
-
-                onProgress(info);
-              }
-            } catch {
-              // Ignore progress callback errors
+            if (percent) {
+              try {
+                onProgress({
+                  percent: Number(percent[1]),
+                  speed: speed?.[1],
+                  eta: eta?.[1]
+                });
+              } catch {}
             }
           }
         });
 
-        proc.on('error', async (error) => {
-          console.error('[Downloader] Process start error:', error.message);
-          await fail(
-            new Error(`Could not start yt-dlp: ${error.message}`)
+        proc.once('error', (err) => {
+          if (settled) return;
+
+          console.error(
+            '[Downloader] Executable error:',
+            command,
+            err.code,
+            err.message
           );
+
+          if (!started && err.code === 'ENOENT') {
+            startProcess(index + 1);
+            return;
+          }
+
+          fail(`Could not start yt-dlp: ${err.code || err.message}`);
         });
 
-        proc.on('close', async (code, signal) => {
+        proc.once('close', async (code, signal) => {
           if (settled) return;
 
           await cleanup();
 
           if (timedOut) {
-            await fail(new Error('Download timed out after 10 minutes.'));
+            await fail('Download timed out after 10 minutes.');
             return;
           }
 
           if (code !== 0) {
             const details = stderr.trim().replace(/\s+/g, ' ');
-            const reason = details || `exit code ${code}, signal ${signal || 'none'}`;
-
-            console.error('[Downloader] yt-dlp failed:', reason);
-
             await fail(
-              new Error(`yt-dlp failed: ${reason.slice(0, 350)}`)
+              details
+                ? `yt-dlp error: ${details.slice(-500)}`
+                : `yt-dlp exited with code ${code}, signal ${signal || 'none'}`
             );
             return;
           }
 
           try {
             const files = await fs.readdir(tempDir);
-
-            if (files.length === 0) {
-              await fail(
-                new Error('No file downloaded. The link may be invalid or unavailable.')
-              );
-              return;
-            }
-
             let targetFile = null;
-            let maxSize = 0;
-            let thumbnailFile = null;
+            let largestSize = 0;
+            let thumbnail = null;
 
             for (const file of files) {
               const fullPath = path.join(tempDir, file);
               const size = await this.getFileSize(fullPath);
 
-              if (
-                size > maxSize &&
-                !/\.(jpg|jpeg|png|webp|json|description)$/i.test(file)
-              ) {
-                maxSize = size;
+              if (/\.(jpg|jpeg|png|webp)$/i.test(file)) {
+                thumbnail ||= fullPath;
+                continue;
+              }
+
+              if (size > largestSize) {
+                largestSize = size;
                 targetFile = file;
               }
-
-              if (/\.(jpg|jpeg|png|webp)$/i.test(file) && !thumbnailFile) {
-                thumbnailFile = file;
-              }
             }
 
-            if (!targetFile) {
-              await fail(new Error('Downloaded media file was not found.'));
+            if (!targetFile || largestSize === 0) {
+              await fail('No media file was downloaded.');
               return;
             }
 
-            const filePath = path.join(tempDir, targetFile);
-            const fileSize = await this.getFileSize(filePath);
-
-            if (fileSize > MAX_FILESIZE_BYTES) {
-              await fail(
-                new Error('Downloaded file exceeds Telegram 50 MB upload limit.')
-              );
-              return;
-            }
-
-            if (fileSize === 0) {
-              await fail(new Error('Downloaded file is empty.'));
+            if (largestSize > MAX_FILESIZE_BYTES) {
+              await fail('Downloaded file exceeds Telegram 50 MB limit.');
               return;
             }
 
             settled = true;
 
             resolve({
-              filePath,
+              filePath: path.join(tempDir, targetFile),
               tempDir,
               fileName: targetFile,
-              fileSize,
+              fileSize: largestSize,
               audioOnly,
-              title: videoTitle || targetFile.replace(/\.[^/.]+$/, ''),
-              thumbnail: thumbnailFile
-                ? path.join(tempDir, thumbnailFile)
-                : null,
+              title: title || targetFile.replace(/\.[^/.]+$/, ''),
+              thumbnail
             });
-          } catch (error) {
-            await fail(error);
+          } catch (err) {
+            await fail(err.message);
           }
         });
-      } catch (error) {
-        console.error('[Downloader] Unexpected error:', error);
-        await fail(error);
-      }
+      };
+
+      startProcess(0);
     });
   }
 }
